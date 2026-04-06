@@ -19,7 +19,7 @@ from datetime import datetime
 # ═══════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════
-API_BASE = os.getenv("API_BASE", "https://movie-rec-466x.onrender.com")
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 USERS_FILE = "users_db.json"
 WATCHLIST_FILE = "watchlist_db.json"
