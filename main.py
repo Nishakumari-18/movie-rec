@@ -1,38 +1,78 @@
-import os
-import pickle
-from typing import Optional, List, Dict, Any, Tuple
+"""
+main.py
+=========
+FastAPI Backend — Movie Hybrid Recommendation System
 
-import numpy as np
-import pandas as pd
+Architecture:
+    ┌─────────────┐     ┌──────────────────┐
+    │  Streamlit   │────▶│    FastAPI API    │
+    │  Frontend    │◀────│   (this file)    │
+    └─────────────┘     └──────┬───────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                 ▼
+    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ Content-Based │  │Collaborative │  │    Hybrid     │
+    │   TF-IDF     │  │     SVD      │  │   Combiner    │
+    └──────────────┘  └──────────────┘  └──────────────┘
+              │                │                 │
+              └────────────────┼─────────────────┘
+                               ▼
+                    ┌──────────────────┐
+                    │ Personalization  │
+                    │ Explainability   │
+                    │    Metrics       │
+                    └──────────────────┘
+
+All existing endpoints are preserved. New endpoints are added for:
+- Collaborative filtering recommendations
+- Hybrid recommendations
+- User interaction tracking
+- Personalization profiles
+- Evaluation metrics
+"""
+
+import os
+from typing import Optional, List, Dict, Any
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+# ── Import service modules ──
+from services.recommender import ContentRecommender
+from services.collaborative import CollaborativeEngine
+from services.personalization import PersonalizationEngine
+from services.explainability import ExplainabilityEngine
+from services.hybrid import HybridRecommender
+from services.metrics import MetricsEngine
 
 # =========================
 # ENV
 # =========================
 load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
 if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
     raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
 
 
 # =========================
 # FASTAPI APP
 # =========================
-app = FastAPI(title="Movie Recommender API", version="3.0")
+app = FastAPI(
+    title="Movie Hybrid Recommendation System",
+    version="4.0",
+    description="Content-based + Collaborative + Hybrid recommendation engine",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for local streamlit
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,25 +80,23 @@ app.add_middleware(
 
 
 # =========================
-# PICKLE GLOBALS
+# SERVICE INSTANCES (globals)
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
-DF_PATH = os.path.join(BASE_DIR, "df.pkl")
-INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
-TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
-TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
+content_engine = ContentRecommender(BASE_DIR)
+collab_engine = CollaborativeEngine(DATA_DIR, n_factors=50)
+personal_engine = PersonalizationEngine(DATA_DIR)
 
-df: Optional[pd.DataFrame] = None
-indices_obj: Any = None
-tfidf_matrix: Any = None
-tfidf_obj: Any = None
-
-TITLE_TO_IDX: Optional[Dict[str, int]] = None
+# These depend on the above, so initialized after startup
+explain_engine: Optional[ExplainabilityEngine] = None
+hybrid_engine: Optional[HybridRecommender] = None
+metrics_engine: Optional[MetricsEngine] = None
 
 
 # =========================
-# MODELS
+# PYDANTIC MODELS
 # =========================
 class TMDBMovieCard(BaseModel):
     tmdb_id: int
@@ -84,6 +122,16 @@ class TFIDFRecItem(BaseModel):
     tmdb: Optional[TMDBMovieCard] = None
 
 
+class HybridRecItem(BaseModel):
+    title: str
+    score: float
+    content_score: float
+    collab_score: float
+    reason: str
+    source: str
+    tmdb: Optional[TMDBMovieCard] = None
+
+
 class SearchBundleResponse(BaseModel):
     query: str
     movie_details: TMDBMovieDetails
@@ -91,13 +139,17 @@ class SearchBundleResponse(BaseModel):
     genre_recommendations: List[TMDBMovieCard]
 
 
-# =========================
-# UTILS
-# =========================
-def _norm_title(t: str) -> str:
-    return str(t).strip().lower()
+class InteractionRequest(BaseModel):
+    user_email: str
+    movie_title: str
+    interaction_type: str  # "watchlist", "click", "search"
+    tmdb_id: Optional[int] = None
+    genres: Optional[List[str]] = None
 
 
+# =========================
+# TMDB UTILITIES (preserved from original)
+# =========================
 def make_img_url(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -105,45 +157,28 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
 
 
 async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Safe TMDB GET:
-    - Network errors -> 502
-    - TMDB API errors -> 502 with detail
-    """
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
-
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(f"{TMDB_BASE}{path}", params=q)
     except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
-        )
-
+        raise HTTPException(status_code=502, detail=f"TMDB request error: {repr(e)}")
     if r.status_code != 200:
-        raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
-        )
-
+        raise HTTPException(status_code=502, detail=f"TMDB error {r.status_code}: {r.text}")
     return r.json()
 
 
-async def tmdb_cards_from_results(
-    results: List[dict], limit: int = 20
-) -> List[TMDBMovieCard]:
-    out: List[TMDBMovieCard] = []
+async def tmdb_cards_from_results(results: List[dict], limit: int = 20) -> List[TMDBMovieCard]:
+    out = []
     for m in (results or [])[:limit]:
-        out.append(
-            TMDBMovieCard(
-                tmdb_id=int(m["id"]),
-                title=m.get("title") or m.get("name") or "",
-                poster_url=make_img_url(m.get("poster_path")),
-                release_date=m.get("release_date"),
-                vote_average=m.get("vote_average"),
-            )
-        )
+        out.append(TMDBMovieCard(
+            tmdb_id=int(m["id"]),
+            title=m.get("title") or m.get("name") or "",
+            poster_url=make_img_url(m.get("poster_path")),
+            release_date=m.get("release_date"),
+            vote_average=m.get("vote_average"),
+        ))
     return out
 
 
@@ -161,18 +196,9 @@ async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
 
 
 async def tmdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
-    """
-    Raw TMDB response for keyword search (MULTIPLE results).
-    Streamlit will use this for suggestions and grid.
-    """
     return await tmdb_get(
         "/search/movie",
-        {
-            "query": query,
-            "include_adult": "false",
-            "language": "en-US",
-            "page": page,
-        },
+        {"query": query, "include_adult": "false", "language": "en-US", "page": page},
     )
 
 
@@ -182,86 +208,7 @@ async def tmdb_search_first(query: str) -> Optional[dict]:
     return results[0] if results else None
 
 
-# =========================
-# TF-IDF Helpers
-# =========================
-def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
-    """
-    indices.pkl can be:
-    - dict(title -> index)
-    - pandas Series (index=title, value=index)
-    We normalize into TITLE_TO_IDX.
-    """
-    title_to_idx: Dict[str, int] = {}
-
-    if isinstance(indices, dict):
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-
-    # pandas Series or similar mapping
-    try:
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-        return title_to_idx
-    except Exception:
-        # last resort: if it's a list-like etc.
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like (with .items())"
-        )
-
-
-def get_local_idx_by_title(title: str) -> int:
-    global TITLE_TO_IDX
-    if TITLE_TO_IDX is None:
-        raise HTTPException(status_code=500, detail="TF-IDF index map not initialized")
-    key = _norm_title(title)
-    if key in TITLE_TO_IDX:
-        return int(TITLE_TO_IDX[key])
-    raise HTTPException(
-        status_code=404, detail=f"Title not found in local dataset: '{title}'"
-    )
-
-
-def tfidf_recommend_titles(
-    query_title: str, top_n: int = 10
-) -> List[Tuple[str, float]]:
-    """
-    Returns list of (title, score) from local df using cosine similarity on TF-IDF matrix.
-    Safe against missing columns/rows.
-    """
-    global df, tfidf_matrix
-    if df is None or tfidf_matrix is None:
-        raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
-
-    idx = get_local_idx_by_title(query_title)
-
-    # query vector
-    qv = tfidf_matrix[idx]
-    scores = (tfidf_matrix @ qv.T).toarray().ravel()
-
-    # sort descending
-    order = np.argsort(-scores)
-
-    out: List[Tuple[str, float]] = []
-    for i in order:
-        if int(i) == int(idx):
-            continue
-        try:
-            title_i = str(df.iloc[int(i)]["title"])
-        except Exception:
-            continue
-        out.append((title_i, float(scores[int(i)])))
-        if len(out) >= top_n:
-            break
-    return out
-
-
 async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
-    """
-    Uses TMDB search by title to fetch poster for a local title.
-    If not found, returns None (never crashes the endpoint).
-    """
     try:
         m = await tmdb_search_first(title)
         if not m:
@@ -278,194 +225,154 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
 
 
 # =========================
-# STARTUP: LOAD PICKLES
+# STARTUP
 # =========================
 @app.on_event("startup")
-def load_pickles():
-    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+def startup():
+    global explain_engine, hybrid_engine, metrics_engine
 
-    # Load df
-    with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
+    # Load content-based engine (pickles)
+    content_engine.load()
 
-    # Load indices
-    with open(INDICES_PATH, "rb") as f:
-        indices_obj = pickle.load(f)
+    # Load collaborative engine (user interactions)
+    collab_engine.load_interactions()
 
-    # Load TF-IDF matrix (usually scipy sparse)
-    with open(TFIDF_MATRIX_PATH, "rb") as f:
-        tfidf_matrix = pickle.load(f)
+    # Initialize dependent engines
+    explain_engine = ExplainabilityEngine(personal_engine, content_engine)
+    hybrid_engine = HybridRecommender(
+        content_engine=content_engine,
+        collab_engine=collab_engine,
+        explain_engine=explain_engine,
+        content_weight=0.6,
+    )
+    metrics_engine = MetricsEngine(collab_engine, content_engine, hybrid_engine)
 
-    # Load tfidf vectorizer (optional, not used directly here)
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
+    # Ensure data directory exists
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Build normalized map
-    TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
-
-    # sanity
-    if df is None or "title" not in df.columns:
-        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+    print("=" * 60)
+    print("  Movie Hybrid Recommendation System v4.0")
+    print(f"  Content engine: {len(content_engine.title_to_idx)} movies loaded")
+    print(f"  Collab engine:  {collab_engine.stats['total_users']} users tracked")
+    print("=" * 60)
 
 
-# =========================
-# ROUTES
-# =========================
+# ═══════════════════════════════════════════════════════════
+# EXISTING ENDPOINTS (preserved from original)
+# ═══════════════════════════════════════════════════════════
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "version": "4.0",
+        "content_movies": len(content_engine.title_to_idx) if content_engine.is_loaded else 0,
+        "collab_users": collab_engine.stats["total_users"],
+    }
 
 
-# ---------- HOME FEED (TMDB) ----------
 @app.get("/home", response_model=List[TMDBMovieCard])
 async def home(
     category: str = Query("popular"),
     limit: int = Query(24, ge=1, le=50),
 ):
-    """
-    Home feed for Streamlit (posters).
-    category:
-      - trending (trending/movie/day)
-      - popular, top_rated, upcoming, now_playing  (movie/{category})
-    """
+    """Home feed (TMDB trending/popular/etc.)"""
     try:
         if category == "trending":
             data = await tmdb_get("/trending/movie/day", {"language": "en-US"})
             return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
         if category not in {"popular", "top_rated", "upcoming", "now_playing"}:
             raise HTTPException(status_code=400, detail="Invalid category")
-
         data = await tmdb_get(f"/movie/{category}", {"language": "en-US", "page": 1})
         return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Home route failed: {e}")
 
 
-# ---------- TMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
 @app.get("/tmdb/search")
 async def tmdb_search(
     query: str = Query(..., min_length=1),
     page: int = Query(1, ge=1, le=10),
 ):
-    """
-    Returns RAW TMDB shape with 'results' list.
-    Streamlit will use it for:
-      - dropdown suggestions
-      - grid results
-    """
+    """Raw TMDB keyword search."""
     return await tmdb_search_movies(query=query, page=page)
 
 
-# ---------- MOVIE DETAILS (SAFE ROUTE) ----------
 @app.get("/movie/id/{tmdb_id}", response_model=TMDBMovieDetails)
 async def movie_details_route(tmdb_id: int):
     return await tmdb_movie_details(tmdb_id)
 
 
-# ---------- GENRE RECOMMENDATIONS ----------
 @app.get("/recommend/genre", response_model=List[TMDBMovieCard])
 async def recommend_genre(
     tmdb_id: int = Query(...),
     limit: int = Query(18, ge=1, le=50),
 ):
-    """
-    Given a TMDB movie ID:
-    - fetch details
-    - pick first genre
-    - discover movies in that genre (popular)
-    """
+    """Genre-based recommendations via TMDB discover."""
     details = await tmdb_movie_details(tmdb_id)
     if not details.genres:
         return []
-
     genre_id = details.genres[0]["id"]
     discover = await tmdb_get(
         "/discover/movie",
-        {
-            "with_genres": genre_id,
-            "language": "en-US",
-            "sort_by": "popularity.desc",
-            "page": 1,
-        },
+        {"with_genres": genre_id, "language": "en-US", "sort_by": "popularity.desc", "page": 1},
     )
     cards = await tmdb_cards_from_results(discover.get("results", []), limit=limit)
     return [c for c in cards if c.tmdb_id != tmdb_id]
 
 
-# ---------- TF-IDF ONLY (debug/useful) ----------
 @app.get("/recommend/tfidf")
 async def recommend_tfidf(
     title: str = Query(..., min_length=1),
     top_n: int = Query(10, ge=1, le=50),
 ):
-    recs = tfidf_recommend_titles(title, top_n=top_n)
-    return [{"title": t, "score": s} for t, s in recs]
+    """Content-based TF-IDF recommendations."""
+    try:
+        recs = content_engine.recommend(title, top_n=top_n)
+        return [{"title": r["title"], "score": r["score"]} for r in recs]
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
-# ---------- BUNDLE: Details + TF-IDF recs + Genre recs ----------
 @app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
     query: str = Query(..., min_length=1),
     tfidf_top_n: int = Query(12, ge=1, le=30),
     genre_limit: int = Query(12, ge=1, le=30),
 ):
-    """
-    This endpoint is for when you have a selected movie and want:
-      - movie details
-      - TF-IDF recommendations (local) + posters
-      - Genre recommendations (TMDB) + posters
-
-    NOTE:
-    - It selects the BEST match from TMDB for the given query.
-    - If you want MULTIPLE matches, use /tmdb/search
-    """
+    """Bundle: movie details + TF-IDF recs + genre recs."""
     best = await tmdb_search_first(query)
     if not best:
-        raise HTTPException(
-            status_code=404, detail=f"No TMDB movie found for query: {query}"
-        )
+        raise HTTPException(status_code=404, detail=f"No TMDB movie found for: {query}")
 
     tmdb_id = int(best["id"])
     details = await tmdb_movie_details(tmdb_id)
 
-    # 1) TF-IDF recommendations (never crash endpoint)
-    tfidf_items: List[TFIDFRecItem] = []
-
-    recs: List[Tuple[str, float]] = []
+    # TF-IDF recommendations
+    tfidf_items = []
     try:
-        # try local dataset by TMDB title
-        recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
+        recs = content_engine.recommend(details.title, top_n=tfidf_top_n)
     except Exception:
-        # fallback to user query
         try:
-            recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
+            recs = content_engine.recommend(query, top_n=tfidf_top_n)
         except Exception:
             recs = []
 
-    for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
-        tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+    for r in recs:
+        card = await attach_tmdb_card_by_title(r["title"])
+        tfidf_items.append(TFIDFRecItem(title=r["title"], score=r["score"], tmdb=card))
 
-    # 2) Genre recommendations (TMDB discover by first genre)
-    genre_recs: List[TMDBMovieCard] = []
+    # Genre recommendations
+    genre_recs = []
     if details.genres:
         genre_id = details.genres[0]["id"]
         discover = await tmdb_get(
             "/discover/movie",
-            {
-                "with_genres": genre_id,
-                "language": "en-US",
-                "sort_by": "popularity.desc",
-                "page": 1,
-            },
+            {"with_genres": genre_id, "language": "en-US", "sort_by": "popularity.desc", "page": 1},
         )
-        cards = await tmdb_cards_from_results(
-            discover.get("results", []), limit=genre_limit
-        )
+        cards = await tmdb_cards_from_results(discover.get("results", []), limit=genre_limit)
         genre_recs = [c for c in cards if c.tmdb_id != details.tmdb_id]
 
     return SearchBundleResponse(
@@ -474,3 +381,216 @@ async def search_bundle(
         tfidf_recommendations=tfidf_items,
         genre_recommendations=genre_recs,
     )
+
+
+# ═══════════════════════════════════════════════════════════
+# NEW ENDPOINTS: Collaborative Filtering
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/recommend/collaborative")
+async def recommend_collaborative(
+    user_email: str = Query(..., min_length=1),
+    top_n: int = Query(12, ge=1, le=50),
+):
+    """
+    Collaborative filtering recommendations based on user behavior.
+    Uses SVD matrix factorization on the user-item interaction matrix.
+    """
+    recs = collab_engine.recommend(user_email, top_n=top_n)
+
+    # Attach TMDB posters
+    results = []
+    for r in recs:
+        card = await attach_tmdb_card_by_title(r["title"])
+        results.append({
+            "title": r["title"],
+            "score": round(r["score"], 4),
+            "tmdb": card.dict() if card else None,
+        })
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+# NEW ENDPOINTS: Hybrid Recommendations
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/recommend/hybrid")
+async def recommend_hybrid(
+    user_email: str = Query(..., min_length=1),
+    movie_title: Optional[str] = Query(None),
+    top_n: int = Query(12, ge=1, le=30),
+):
+    """
+    Hybrid recommendations combining content-based and collaborative signals.
+    
+    final_score = 0.6 × content_score + 0.4 × collab_score
+    
+    If movie_title is provided, recommendations are seeded from that movie.
+    Otherwise, recommendations are based on the user's full interaction history.
+    """
+    if hybrid_engine is None:
+        raise HTTPException(status_code=500, detail="Hybrid engine not initialized")
+
+    recs = hybrid_engine.recommend(
+        user_email=user_email,
+        movie_title=movie_title,
+        top_n=top_n,
+    )
+
+    # Attach TMDB poster data
+    results = []
+    for r in recs:
+        card = await attach_tmdb_card_by_title(r["title"])
+        results.append(HybridRecItem(
+            title=r["title"],
+            score=r["score"],
+            content_score=r["content_score"],
+            collab_score=r["collab_score"],
+            reason=r["reason"],
+            source=r["source"],
+            tmdb=card,
+        ))
+    return results
+
+
+@app.get("/recommend/for-you")
+async def recommend_for_you(
+    user_email: str = Query(..., min_length=1),
+    top_n: int = Query(12, ge=1, le=30),
+):
+    """
+    Personalized "Recommended For You" endpoint.
+    Combines watchlist-based content analysis with collaborative patterns.
+    """
+    if hybrid_engine is None:
+        raise HTTPException(status_code=500, detail="Hybrid engine not initialized")
+
+    recs = hybrid_engine.recommend_for_you(user_email=user_email, top_n=top_n)
+
+    results = []
+    for r in recs:
+        card = await attach_tmdb_card_by_title(r["title"])
+        results.append(HybridRecItem(
+            title=r["title"],
+            score=r["score"],
+            content_score=r["content_score"],
+            collab_score=r["collab_score"],
+            reason=r["reason"],
+            source=r["source"],
+            tmdb=card,
+        ))
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+# NEW ENDPOINTS: Interaction Tracking
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/track/interaction")
+async def track_interaction(req: InteractionRequest):
+    """
+    Record a user-movie interaction for collaborative filtering.
+    
+    interaction_type: "watchlist" | "click" | "search"
+    This updates both the collaborative engine and personalization profile.
+    """
+    # Update collaborative engine
+    collab_engine.record_interaction(
+        req.user_email, req.movie_title, req.interaction_type
+    )
+
+    # Update personalization profile
+    if req.interaction_type == "click":
+        personal_engine.record_click(
+            req.user_email,
+            tmdb_id=req.tmdb_id or 0,
+            title=req.movie_title,
+            genres=req.genres,
+        )
+    elif req.interaction_type == "watchlist":
+        personal_engine.record_watchlist(
+            req.user_email,
+            title=req.movie_title,
+            genres=req.genres,
+        )
+    elif req.interaction_type == "search":
+        personal_engine.record_search(req.user_email, req.movie_title)
+
+    return {"status": "recorded", "type": req.interaction_type}
+
+
+@app.post("/track/sync-watchlist")
+async def sync_watchlist(user_email: str, titles: List[str]):
+    """Bulk sync watchlist into collaborative engine."""
+    collab_engine.record_watchlist_bulk(user_email, titles)
+    return {"status": "synced", "count": len(titles)}
+
+
+# ═══════════════════════════════════════════════════════════
+# NEW ENDPOINTS: Personalization
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/user/profile")
+async def user_profile(user_email: str = Query(..., min_length=1)):
+    """Get the user's personalization profile."""
+    return personal_engine.get_profile(user_email)
+
+
+@app.get("/user/top-genres")
+async def user_top_genres(
+    user_email: str = Query(..., min_length=1),
+    top_n: int = Query(5, ge=1, le=20),
+):
+    """Get user's most-interacted genres."""
+    return personal_engine.get_top_genres(user_email, top_n=top_n)
+
+
+@app.get("/user/stats")
+async def user_stats(user_email: str = Query(..., min_length=1)):
+    """Get engagement statistics for a user."""
+    return personal_engine.get_engagement_stats(user_email)
+
+
+# ═══════════════════════════════════════════════════════════
+# NEW ENDPOINTS: Metrics & Evaluation
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/metrics")
+async def get_metrics(k: int = Query(10, ge=1, le=50)):
+    """
+    Evaluate the recommendation system.
+    
+    Returns: Precision@K, Recall@K, NDCG@K, RMSE, Hit Rate
+    averaged across all users.
+    """
+    if metrics_engine is None:
+        raise HTTPException(status_code=500, detail="Metrics engine not initialized")
+
+    results = metrics_engine.evaluate_all_users(k=k)
+    coverage = metrics_engine.catalog_coverage(k=k)
+
+    return {
+        **results,
+        **coverage,
+        "collab_stats": collab_engine.stats,
+        "personalization_stats": personal_engine.global_stats(),
+    }
+
+
+@app.get("/metrics/user")
+async def get_user_metrics(
+    user_email: str = Query(..., min_length=1),
+    k: int = Query(10, ge=1, le=50),
+):
+    """Evaluate recommendation quality for a specific user."""
+    if metrics_engine is None:
+        raise HTTPException(status_code=500, detail="Metrics engine not initialized")
+    return metrics_engine.evaluate_user(user_email, k=k)
+
+
+@app.get("/metrics/algorithms")
+async def algorithm_explanations():
+    """Get explanations of each algorithm (for Model Insights page)."""
+    if explain_engine is None:
+        raise HTTPException(status_code=500, detail="Explain engine not initialized")
+    return explain_engine.explain_algorithm()
